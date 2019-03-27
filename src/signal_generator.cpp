@@ -1412,18 +1412,18 @@ void SignalGenerator::stop()
 
 void SignalGenerator::startStop(bool pressed)
 {
-
+	if (amp1 && amp2) {
+		/* FIXME: TODO: Move this into a HW class / lib M2k */
+		iio_channel_attr_write_bool(amp1, "powerdown", !pressed);
+		iio_channel_attr_write_bool(amp2, "powerdown", !pressed);
+	}
 	if (pressed) {
 		start();
 	} else {
 		stop();
 	}
 
-	if (amp1 && amp2) {
-		/* FIXME: TODO: Move this into a HW class / lib M2k */
-		iio_channel_attr_write_bool(amp1, "powerdown", !pressed);
-		iio_channel_attr_write_bool(amp2, "powerdown", !pressed);
-	}
+	
 
 	setDynamicProperty(ui->run_button, "running", pressed);
 }
