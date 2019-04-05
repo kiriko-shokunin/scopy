@@ -513,7 +513,7 @@ QWidget {
               </sizepolicy>
              </property>
              <property name="currentIndex">
-              <number>2</number>
+              <number>3</number>
              </property>
              <widget class="QWidget" name="channelSettings">
               <layout class="QVBoxLayout" name="verticalLayout_4">
@@ -2041,6 +2041,12 @@ QLabel {
    <header>customPushButton.hpp</header>
   </customwidget>
   <customwidget>
+   <class>adiscope::RunSingleWidget</class>
+   <extends>QWidget</extends>
+   <header>runsinglewidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
    <class>adiscope::CustomSwitch</class>
    <extends>QPushButton</extends>
    <header>customSwitch.hpp</header>
@@ -2049,12 +2055,6 @@ QLabel {
    <class>adiscope::MarkerTable</class>
    <extends>QWidget</extends>
    <header location="global">marker_table.hpp</header>
-   <container>1</container>
-  </customwidget>
-  <customwidget>
-   <class>adiscope::RunSingleWidget</class>
-   <extends>QWidget</extends>
-   <header>runsinglewidget.h</header>
    <container>1</container>
   </customwidget>
  </customwidgets>

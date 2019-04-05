@@ -1254,6 +1254,9 @@ void SignalGenerator::start()
 		return;
 	}
 
+	QElapsedTimer t;
+	t.start();
+
 	for (auto it = channels.begin(); it != channels.end(); ++it) {
 		if (!(*it)->enableButton()->isChecked()) {
 			continue;
@@ -1399,6 +1402,8 @@ void SignalGenerator::start()
 
 		iio_device_attr_write_bool(dev, "dma_sync", false);
 	}
+
+	std::cout << "time till signal started: " << t.elapsed() << " ms" << std::endl;
 }
 
 void SignalGenerator::stop()

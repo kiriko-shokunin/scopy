@@ -30,26 +30,19 @@
 
 #include <gnuradio/analog/sig_source_c.h>
 #include <gnuradio/analog/sig_source_waveform.h>
-#include <gnuradio/blocks/complex_to_arg.h>
-#include <gnuradio/blocks/complex_to_mag_squared.h>
 #include <gnuradio/blocks/float_to_short.h>
 #include <gnuradio/blocks/moving_average_cc.h>
-#include <gnuradio/blocks/multiply_cc.h>
-#include <gnuradio/blocks/multiply_conjugate_cc.h>
 #include <gnuradio/blocks/null_sink.h>
 #include <gnuradio/blocks/null_source.h>
 #include <gnuradio/blocks/rotator_cc.h>
 #include <gnuradio/blocks/skiphead.h>
-#include <gnuradio/blocks/vector_sink_f.h>
 #include <gnuradio/top_block.h>
 #include <boost/make_shared.hpp>
 #include "filter_dc_offset_block.h"
 #include <gnuradio/blocks/stream_to_vector.h>
 #include <gnuradio/blocks/vector_to_stream.h>
-#include <gnuradio/blocks/vector_source_f.h>
-#include <gnuradio/blocks/max_ff.h>
+#include <gnuradio/fft/goertzel_fc.h>
 
-#include "adc_sample_conv.hpp"
 #include "hw_dac.h"
 
 #include <algorithm>
@@ -62,13 +55,96 @@
 #include <iio.h>
 #include <network_analyzer_api.hpp>
 
-/* This should go away ASAP... */
-#define DAC_BIT_COUNT   12
-#define INTERP_BY_100_CORR 1.168 // correction value at an interpolation by 100
-#define AMPLITUDE_VOLTS	5.0
+#include <QElapsedTimer>
 
 using namespace adiscope;
 using namespace gr;
+
+void NetworkAnalyzer::_configureDacFlowgraph()
+{
+	f2s_block = blocks::float_to_short::make(1, 1);
+	head_block = blocks::head::make(sizeof(short), 1);
+	vector_block = blocks::vector_sink_s::make();
+
+	// Connect the blocks for the sine wave generation
+	top_block->connect(source_block, 0, f2s_block, 0);
+	top_block->connect(f2s_block, 0, head_block, 0);
+	top_block->connect(head_block, 0, vector_block, 0);
+}
+
+void NetworkAnalyzer::_configureAdcFlowgraph()
+{
+	static bool initFlowgraph = true;
+
+	if (initFlowgraph) {
+
+		// Build the flowgraph only once
+		initFlowgraph = false;
+
+		// Get the available sample rates for the m2k-adc
+		// Make sure the values are sorted in ascending order (1000,..,100e6)
+		sampleRates = SignalGenerator::get_available_sample_rates(adc);
+		qSort(sampleRates.begin(), sampleRates.end(), qLess<unsigned long>());
+		fixedRate = sampleRates[0];
+
+		auto m2k_adc = std::dynamic_pointer_cast<M2kAdc>(adc_dev);
+
+		goertzel1 = gr::fft::goertzel_fc::make(1, 1, 1);
+		goertzel2 = gr::fft::goertzel_fc::make(1, 1, 1);
+		copy1 = gr::blocks::copy::make(sizeof(float));
+		copy2 = gr::blocks::copy::make(sizeof(float));
+		head1 = gr::blocks::head::make(sizeof(float), 1);
+		head2 = gr::blocks::head::make(sizeof(float), 1);
+		sink1 = gr::blocks::vector_sink_f::make();
+		sink2 = gr::blocks::vector_sink_f::make();
+		c2m1 = gr::blocks::complex_to_mag_squared::make();
+		c2m2 = gr::blocks::complex_to_mag_squared::make();
+		conj = gr::blocks::multiply_conjugate_cc::make();
+		c2a = gr::blocks::complex_to_arg::make();
+		signal = boost::make_shared<signal_sample>();
+		adc_conv = boost::make_shared<adc_sample_conv>(2, m2k_adc);
+
+		adc_conv->setCorrectionGain(0,
+			m2k_adc->chnCorrectionGain(0));
+		adc_conv->setCorrectionGain(1,
+			m2k_adc->chnCorrectionGain(1));
+
+		id1 = iio->connect(head1, 0, 0, true,
+				   1);
+		id2 = iio->connect(head2, 1, 0, true,
+				   1);
+
+		iio->connect(head1, 0, copy1, 0);
+		iio->connect(head2, 0, copy2, 0);
+
+		iio->connect(copy1, 0, goertzel1, 0);
+		iio->connect(copy2, 0, goertzel2, 0);
+		iio->connect(goertzel1, 0, c2m1, 0);
+		iio->connect(c2m1, 0, signal, 0);
+		iio->connect(goertzel2, 0, c2m2, 0);
+		iio->connect(c2m2, 0, signal, 1);
+
+		iio->connect(goertzel1, 0, conj, 0);
+		iio->connect(goertzel2, 0, conj, 1);
+		iio->connect(conj, 0, c2a, 0);
+		iio->connect(c2a, 0, signal, 2);
+
+		mag1 = 0.0, mag2 = 0.0, phase = 0.0;
+		connect(&*signal, &signal_sample::triggered,
+		[&](const std::vector<float> values) {
+			mag1 = values[0];
+			mag2 = values[1];
+			phase = values[2];
+			captureDone = true;
+			std::cout << "Capture Done" << std::endl;
+		});
+
+		iio->connect(copy1, 0, adc_conv, 0);
+		iio->connect(copy2, 0, adc_conv, 1);
+		iio->connect(adc_conv, 0, sink1, 0);
+		iio->connect(adc_conv, 1, sink2, 0);
+	}
+}
 
 NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 				 std::shared_ptr<GenericAdc>& adc_dev,
@@ -117,8 +193,17 @@ NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 	bufferPreviewer = new NetworkAnalyzerBufferViewer();
 	bufferPreviewer->setVisible(false);
 
+	ui->statusLabel->setText("Stopped");
+
 	connect(ui->bufferPreviewSwitch, &QCheckBox::toggled,
 		this, &NetworkAnalyzer::toggleBufferPreview);
+
+	connect(ui->prevBtn, &QPushButton::pressed,
+		bufferPreviewer, &NetworkAnalyzerBufferViewer::btnPreviousClicked);
+	connect(ui->nextBtn, &QPushButton::pressed,
+		bufferPreviewer, &NetworkAnalyzerBufferViewer::btnNextClicked);
+	connect(ui->viewInOscBtn, &QPushButton::pressed,
+		bufferPreviewer, &NetworkAnalyzerBufferViewer::sendBufferToOscilloscope);
 
 	connect(ui->runSingleWidget, &RunSingleWidget::toggled,
 		[=](bool checked){
@@ -133,7 +218,7 @@ NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 	connect(this, &NetworkAnalyzer::sweepDone,
 	[=]() {
 		if (ui->runSingleWidget->runButtonChecked()) {
-			thd = QtConcurrent::run(this, &NetworkAnalyzer::run);
+			thd = QtConcurrent::run(this, &NetworkAnalyzer::goertzel);
 			return;
 		}
 
@@ -173,8 +258,8 @@ NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 	m_dBgraph.setYTitle("Magnitude(dB)");
 	m_dBgraph.setXMin(1000.000000);
 	m_dBgraph.setXMax(50000.000000);
-	m_dBgraph.setYMin(-90.000000);
-	m_dBgraph.setYMax(10.000000);
+	m_dBgraph.setYMin(-80.000000);
+	m_dBgraph.setYMax(20.000000);
 	m_dBgraph.useLogFreq(true);
 
 	m_phaseGraph.setColor(QColor(144,19,254));
@@ -209,12 +294,12 @@ NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 	magMax = new PositionSpinButton({
 		{"dB",1e0}
 	}, "Max. Magnitude", -120, 120, false, false, this);
-	magMax->setValue(10);
+	magMax->setValue(20);
 
 	magMin = new PositionSpinButton({
 		{"dB",1e0}
 	}, "Min. Magnitude", -120, 120, false, false, this);
-	magMin->setValue(-90);
+	magMin->setValue(-80);
 
 	phaseMax = new PositionSpinButton({
 		{"°",1e0}
@@ -280,6 +365,8 @@ NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 	connect(ui->btnIsLog, SIGNAL(toggled(bool)),
 		&m_phaseGraph, SLOT(useLogFreq(bool)));
 
+	ui->nicholsgraph->setPlotBarEnabled(false);
+
 	connect(phaseMin, &PositionSpinButton::valueChanged,
 		this, &NetworkAnalyzer::onMinMaxPhaseChanged);
 	connect(phaseMax, &PositionSpinButton::valueChanged,
@@ -335,6 +422,17 @@ NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 		&m_dBgraph, &dBgraph::onFrequencyBarMoved);
 	connect(bufferPreviewer, &NetworkAnalyzerBufferViewer::moveHandleAt,
 		&m_phaseGraph, &dBgraph::onFrequencyBarMoved);
+	connect(bufferPreviewer, &NetworkAnalyzerBufferViewer::indexChanged,
+		[=](int value) {
+		ui->currentFrequencyLabel->setVisible(true);
+		ui->currentSampleLabel->setVisible(true);
+		ui->currentSampleLabel->setText(QString("Sample: " + QString::number(1 + value)
+							+ " / " + QString::number(m_dBgraph.getNumSamples()) + " "));
+		MetricPrefixFormatter d_cursorTimeFormatter;
+		d_cursorTimeFormatter.setTwoDecimalMode(false);
+		QString text = d_cursorTimeFormatter.format(iterations[value].frequency, "Hz", 3);
+		ui->currentFrequencyLabel->setText(QString("Current Frequency: " + text));
+	});
 
 
 	connect(&m_dBgraph, &dBgraph::frequencySelected,
@@ -443,6 +541,8 @@ NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 		img.save(fileName, 0, -1);
 	});
 
+	ui->deltaBtn->setDisabled(ui->btnIsLog->isChecked());
+
 	connect(ui->deltaBtn, &QPushButton::toggled,
 		&m_dBgraph, &dBgraph::useDeltaLabel);
 	connect(ui->deltaBtn, &QPushButton::toggled,
@@ -463,23 +563,8 @@ NetworkAnalyzer::NetworkAnalyzer(struct iio_context *ctx, Filter *filt,
 	source_block = analog::sig_source_f::make(1, analog::GR_SIN_WAVE,
 			1, 1, 1);
 
-	// DAC_RAW = (-Vout * 2^11) / 5V
-	// Multiplying with 16 because the HDL considers the DAC data as 16 bit
-	// instead of 12 bit(data is shifted to the left).
-	f2s_block = blocks::float_to_short::make(1, 1);
-	head_block = blocks::head::make(sizeof(short), 1);
-	vector_block = blocks::vector_sink_s::make();
-
-	// Connect the blocks for the sine wave generation
-	top_block->connect(source_block, 0, f2s_block, 0);
-	top_block->connect(f2s_block, 0, head_block, 0);
-	top_block->connect(head_block, 0, vector_block, 0);
-
-	// Get the available sample rates for the m2k-adc
-	// Make sure the values are sorted in ascending order (1000,..,100e6)
-	sampleRates = SignalGenerator::get_available_sample_rates(adc);
-	qSort(sampleRates.begin(), sampleRates.end(), qLess<unsigned long>());
-	fixedRate = sampleRates[0];
+	_configureDacFlowgraph();
+	_configureAdcFlowgraph();
 }
 
 NetworkAnalyzer::~NetworkAnalyzer()
@@ -487,7 +572,7 @@ NetworkAnalyzer::~NetworkAnalyzer()
 	disconnect(prefPanel,&Preferences::notify,this,
 		   &NetworkAnalyzer::readPreferences);
 	startStop(false);
-
+	ui->runSingleWidget->toggle(false);
 
 	if (saveOnExit) {
 		api->save(*settings);
@@ -551,7 +636,7 @@ void NetworkAnalyzer::computeIterations()
 	// it is safe to modify without using a lock
 	iterationsThreadCanceled = false;
 	iterationsThreadReady = false;
-	iterationsThread = new boost::thread(boost::bind(&NetworkAnalyzer::computeFrequencyArray, this));
+	iterationsThread = new boost::thread(boost::bind(&NetworkAnalyzer::computeFrequencyArray2, this));
 }
 
 void NetworkAnalyzer::setMinimumDistanceBetween(SpinBoxA *min, SpinBoxA *max,
@@ -725,21 +810,21 @@ void NetworkAnalyzer::computeFrequencyArray()
 
 				double newFrequency = rate / (integral + fract);
 
-				if (newFrequency > prev && newFrequency < next && (integral * j > 2)) {
+				if (newFrequency >= prev && newFrequency <= next && (integral * j > 2)) {
 					if (iterationsThreadCanceled) {
 						return;
 					}
 					stop = true;
 					double noNeed;
-					double tempFract = modf(rate / adjFreq[i], &noNeed);
+					/*double tempFract = */modf(rate / adjFreq[i], &noNeed);
 					adjFreq[i] = newFrequency;
-					size_t bufferSize = integral * j;
+					size_t bufferSize = (integral * j)/* + (j - 1)*/;
 
 					while (bufferSize & 0x3) {
 						bufferSize <<= 1;
 					}
 
-					while (bufferSize < 1280) {
+					while (bufferSize < 1024) {
 						bufferSize <<= 1;
 					}
 
@@ -801,10 +886,307 @@ void NetworkAnalyzer::updateGainMode()
 			gain_mode = M2kAdc::HIGH_GAIN_MODE;
 		}
 
-		for (int chn = 0; chn < m2k_adc->numAdcChannels(); chn++) {
+		for (unsigned int chn = 0; chn < m2k_adc->numAdcChannels(); chn++) {
 			m2k_adc->setChnHwGainMode(chn, gain_mode);
 		}
 	}
+}
+
+unsigned long NetworkAnalyzer::_getBestSampleRate(double frequency, const struct iio_device *dev)
+{
+	QVector<unsigned long> values = SignalGenerator::get_available_sample_rates(dev);
+
+	qSort(values.begin(), values.end(), qLess<unsigned long>());
+
+	for (const auto &rate : values) {
+		if (rate == values[0]) {
+			continue;
+		}
+
+		size_t bufferSize = _getSamplesCount(frequency, rate, true);
+
+		if (bufferSize) {
+			return rate;
+		}
+	}
+
+	for (const auto &rate : values) {
+		if (rate == values[0]) {
+			continue;
+		}
+
+		size_t bufferSize = _getSamplesCount(frequency, rate);
+
+		if (bufferSize) {
+			return rate;
+		}
+	}
+
+	std::cout << "no bueno!!!" << std::endl;
+	return 0;
+}
+
+size_t NetworkAnalyzer::_getSamplesCount(double frequency, unsigned long rate, bool perfect)
+{
+	size_t minBufferSize = SignalGenerator::min_buffer_size;
+	size_t maxBufferSize = 128 * 1024;
+
+	double ratio = static_cast<double>(rate) / frequency;
+
+	if (ratio < 10.0 && rate < 75e06) {
+		return 0;
+	}
+
+	if (ratio < 2.5) {
+		return 0;
+	}
+
+	double fract = 0.0;
+	ratio = SignalGenerator::get_best_ratio(ratio, static_cast<double>(maxBufferSize / 4), &fract);
+
+	if (perfect && fract != 0.0) {
+		return 0;
+	}
+
+	size_t size = ratio;
+
+	/* The buffer size must be a multiple of 4 */
+	while (size & 0x3) {
+		size <<= 1;
+	}
+
+	/* The buffer size shouldn't be too small */
+	while (size < minBufferSize) {
+		size <<= 1;
+	}
+
+	if (size > maxBufferSize) {
+		return 0;
+	}
+
+	return size;
+}
+
+void NetworkAnalyzer::computeFrequencyArray2()
+{
+	boost::unique_lock<boost::mutex> lock(iterationsReadyMutex);
+
+	iterations.clear();
+
+	unsigned int steps = (unsigned int) samplesCount->value();
+	double min_freq = startStopRange->getStartValue();
+	double max_freq = startStopRange->getStopValue();
+	double log10_min_freq = log10(min_freq);
+	double log10_max_freq = log10(max_freq);
+	double step;
+
+	bool is_log = ui->btnIsLog->isChecked();
+
+	if (is_log) {
+		step = (log10_max_freq - log10_min_freq) / (double)(steps - 1);
+	} else {
+		step = (max_freq - min_freq) / (double)(steps - 1);
+	}
+
+	for (unsigned int i = 0; i < steps; ++i) {
+
+		if (iterationsThreadCanceled) {
+			return;
+		}
+
+		double frequency;
+
+		if (is_log) {
+			frequency = pow(10.0,
+					log10_min_freq + (double) i * step);
+		} else {
+			frequency = min_freq + (double) i * step;
+		}
+
+		unsigned long rate = _getBestSampleRate(frequency, iio_channel_get_device(dac_channels[0]));
+		size_t bufferSize = _getSamplesCount(frequency, rate);
+
+		iterations.push_back(networkIteration(frequency, rate, bufferSize));
+		std::cout << i << " -> frequency: " << frequency
+			  << " rate: " << rate << " bufferSize: " << bufferSize << std::endl;
+	}
+
+	// Needs to be invoked on the main thread
+	QMetaObject::invokeMethod(this,
+				  "updateNumSamples",
+				  Qt::QueuedConnection,
+				  Q_ARG(bool, true));
+
+	iterationsThreadReady = true;
+	lock.unlock();
+	iterationsReadyCv.notify_one();
+}
+
+void NetworkAnalyzer::goertzel()
+{
+	// Network Analyzer run method using the Goertzel Algorithm (single bin DFT)
+
+	// Enable the available dac channels
+	for (auto& channel : dac_channels) {
+		iio_channel_enable(channel);
+	}
+
+	// Adjust the gain of the ADC channels based on sweep settings
+	updateGainMode();
+
+	// Wait for the iterations thread to finish
+	boost::unique_lock<boost::mutex> lock(iterationsReadyMutex);
+	iterationsReadyCv.wait(lock, boost::bind(&NetworkAnalyzer::isIterationsThreadReady, this));
+	if (iterationsThread) {
+		iterationsThread->join();
+		delete iterationsThread;
+		iterationsThread = nullptr;
+	}
+
+	fixedRate = sampleRates[0];
+
+	justStarted = true;
+
+	for (int i = 0; !stop && i < iterations.size(); ++i) {
+
+		// Get current sweep settings
+		unsigned long rate = iterations[i].rate;
+		size_t samples_count = iterations[i].bufferSize;
+		double frequency = iterations[i].frequency;
+
+		double amplitudeValue = amplitude->value();
+		double offsetValue = offset->value();
+
+		// Create and push the generated sine waves to the DACs
+		QVector<struct iio_buffer *> buffers;
+
+		for (const auto& channel : dac_channels) {
+			const struct iio_device *dev = iio_channel_get_device(channel);
+			iio_device_attr_write_bool(dev, "dma_sync", true);
+			struct iio_buffer *buf_dac = generateSinWave(dev,
+						     frequency, amplitudeValue, offsetValue,
+						     rate, samples_count);
+			buffers.push_back(buf_dac);
+
+			if (!buf_dac) {
+				qCritical() << "Unable to create DAC buffer";
+				break;
+			}
+		}
+
+		// Sleep before DACs start
+		QThread::msleep(pushDelay->value());
+		for (const auto& channel : dac_channels) {
+			const struct iio_device *dev = iio_channel_get_device(channel);
+			iio_device_attr_write_bool(dev, "dma_sync", false);
+		}
+
+
+		size_t buffer_size = 0;
+		size_t adc_rate = 0;
+
+		// Compute capture params for the ADC
+		computeCaptureParams(frequency, buffer_size, adc_rate);
+
+//		uint32_t maxSR = 100e6;
+//		adc_dev->setSampleRate(maxSR);
+//		iio_device_attr_write_double(adc, "oversampling_ratio", maxSR/adc_rate);
+
+		iio_device_attr_write_double(adc, "oversampling_ratio", 1);
+		adc_dev->setSampleRate(adc_rate);
+
+		if (buffer_size == 0) {
+			qDebug(CAT_NETWORK_ANALYZER) << "buffer size 0";
+			return;
+		}
+
+		// Lock the flowgraph if we are already started
+		bool started = iio->started();
+
+		if (started) {
+			iio->lock();
+		}
+
+		goertzel1->set_freq(frequency);
+		goertzel2->set_freq(frequency);
+		goertzel1->set_len(buffer_size);
+		goertzel2->set_len(buffer_size);
+		goertzel1->set_rate(adc_rate);
+		goertzel2->set_rate(adc_rate);
+
+		head1->reset();
+		head2->reset();
+		head1->set_length(buffer_size);
+		head2->set_length(buffer_size);
+
+		iio->set_buffer_size(id1, buffer_size);
+		iio->set_buffer_size(id2, buffer_size);
+
+		sink1->reset();
+		sink2->reset();
+
+		if (started) {
+			iio->unlock();
+		}
+
+		captureDone = false;
+
+		QElapsedTimer t;
+		t.start();
+		// Sleep before ADC capture
+		QThread::msleep(captureDelay->value());
+		iio->start(id1);
+		iio->start(id2);
+
+		// Wait for the signal_sample sink block to capture the data
+		do {
+			QCoreApplication::processEvents();
+			QThread::msleep(10);
+
+			if (stop) {
+				break;
+			}
+		} while (!captureDone);
+
+		std::cout << "Frequency: " << frequency << " Buffer size: " << buffer_size
+			  << " Rate: " << adc_rate << " took: " << t.elapsed() << " ms" << std::endl;
+
+		iio->stop(id1);
+		iio->stop(id2);
+
+		// Clear the iio_buffers that were created
+		for (auto& buffer : buffers) {
+			iio_buffer_destroy(buffer);
+		}
+
+		// Process was cancelled
+		if (stop) {
+			return;
+		}
+
+		QMetaObject::invokeMethod(this,
+					  "_saveChannelBuffers",
+					  Qt::QueuedConnection,
+					  Q_ARG(double, frequency),
+					  Q_ARG(double, adc_rate),
+					  Q_ARG(std::vector<float>, sink1->data()),
+					  Q_ARG(std::vector<float>, sink2->data()));
+
+		// Plot the data captured for this iteration
+		QMetaObject::invokeMethod(this,
+					  "plot",
+					  Qt::QueuedConnection,
+					  Q_ARG(double, frequency),
+					  Q_ARG(double, mag1),
+					  Q_ARG(double, mag2),
+					  Q_ARG(double, phase));
+
+
+
+
+	}
+
+	Q_EMIT sweepDone();
 }
 
 void NetworkAnalyzer::run()
@@ -834,8 +1216,15 @@ void NetworkAnalyzer::run()
 
 	justStarted = true;
 
-	for (unsigned int i = 0; !stop && i < iterations.size(); ++i) {
+	for (int i = 0; !stop && i < iterations.size(); ++i) {
 
+//		for (auto& channel : dac_channels) {
+//			iio_channel_disable(channel);
+//		}
+
+//		for (auto& channel : dac_channels) {
+//			iio_channel_enable(channel);
+//		}
 
 		unsigned long rate = iterations[i].rate;
 		size_t samples_count = iterations[i].bufferSize;
@@ -1015,14 +1404,13 @@ void NetworkAnalyzer::run()
 			got_it = true;
 		});
 
-		QThread::msleep(captureDelay->value());
-		iio->start(id1);
-		iio->start(id2);
-
-
 		if (started) {
 			iio->unlock();
 		}
+
+		QThread::msleep(captureDelay->value());
+		iio->start(id1);
+		iio->start(id2);
 
 		// Wait for the signal_sample sink block to capture the data
 		do {
@@ -1095,6 +1483,10 @@ void NetworkAnalyzer::toggleBufferPreview(bool toggle)
 	m_dBgraph.enableFrequencyBar(toggle);
 	m_phaseGraph.enableFrequencyBar(toggle);
 	d_frequencyHandle->triggerMove();
+
+	ui->viewInOscBtn->setEnabled(toggle);
+	ui->prevBtn->setEnabled(toggle);
+	ui->nextBtn->setEnabled(toggle);
 }
 
 void NetworkAnalyzer::_saveChannelBuffers(double frequency, double sample_rate, std::vector<float> data1, std::vector<float> data2)
@@ -1114,32 +1506,47 @@ void NetworkAnalyzer::computeCaptureParams(double frequency,
 
 	for (const auto& rate : sampleRates) {
 
+		if (rate == sampleRates[0]) {
+			continue;
+		}
+
 		double ratio = rate / frequency;
 		buffer_size = ratio * nrOfPeriods;
 
-		if (rate < fixedRate) {
-			continue;
-		}
+//		if (rate < fixedRate) {
+//			continue;
+//		}
 
 		if (ratio < 2.5) {
 			continue;
 		}
 
-		if (ratio < 14 && fixedRate < sampleRates.back()) {
+		if (ratio < 10 && rate < sampleRates.back()) {
 			continue;
 		}
 
 		// TODO: nrOfPeriods? adjust buffer size to fit perf.
-		while (buffer_size & 0x3) {
+
+//		while (buffer_size & 0x3) {
+//			buffer_size <<= 1;
+//		}
+
+//		while (buffer_size < 1024) {
+//			buffer_size <<= 1;
+//		}
+
+		while (buffer_size < 160) {
 			buffer_size <<= 1;
 		}
 
-		while (buffer_size < 1024) {
-			buffer_size <<= 1;
-		}
+		buffer_size += (buffer_size & 1);
 
 		adc_rate = rate;
-		fixedRate = rate;
+//		fixedRate = rate;
+
+//		if (adc_rate < 10000) {
+//			adc_rate = 10000;
+//		}
 		break;
 	}
 }
@@ -1147,10 +1554,10 @@ void NetworkAnalyzer::computeCaptureParams(double frequency,
 QPair<double, double> NetworkAnalyzer::getPhaseInterval()
 {
 	double maxValue = phaseMax->value();
-	double minValue = phaseMin->value();
+//	double minValue = phaseMin->value();
 
 	double lo = -360;
-	double hi = 360;
+//	double hi = 360;
 
 	double intervalMin = 0;
 	double intervalMax = 0;
@@ -1212,6 +1619,8 @@ void NetworkAnalyzer::plot(double frequency, double mag1, double mag2,
 	m_phaseGraph.plot(frequency, adjusted_phase_deg);
 	ui->xygraph->plot(frequency, mag + magBonus);
 	ui->nicholsgraph->plot(phase_deg, mag + magBonus);
+
+	d_frequencyHandle->triggerMove();
 
 	magBonus = autoUpdateGainMode(mag, magBonus);
 }
@@ -1332,16 +1741,19 @@ void NetworkAnalyzer::startStop(bool pressed)
 		}
 		bufferPreviewer->clear();
 		configHwForNetworkAnalyzing();
-		thd = QtConcurrent::run(this, &NetworkAnalyzer::run);
 		stop = false;
+		thd = QtConcurrent::run(this, &NetworkAnalyzer::goertzel);
+		ui->statusLabel->setText("Running");
 	} else {
+		ui->statusLabel->setText("Stopping...");
 		QCoreApplication::processEvents();
+		stop = true;
 		thd.waitForFinished();
 		m_dBgraph.sweepDone();
 		m_phaseGraph.sweepDone();
 		ui->currentFrequencyLabel->setVisible(pressed);
 		ui->currentSampleLabel->setVisible(pressed);
-		stop = true;
+		ui->statusLabel->setText("Stopped");
 	}
 }
 

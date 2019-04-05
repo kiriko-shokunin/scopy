@@ -35,12 +35,21 @@
 #include <gnuradio/blocks/vector_sink_s.h>
 #include <gnuradio/analog/sig_source_f.h>
 #include <gnuradio/blocks/float_to_short.h>
+#include <gnuradio/fft/goertzel_fc.h>
+#include <gnuradio/blocks/vector_source_f.h>
+#include <gnuradio/blocks/vector_sink_f.h>
+#include <gnuradio/blocks/multiply_cc.h>
+#include <gnuradio/blocks/multiply_conjugate_cc.h>
+#include <gnuradio/blocks/complex_to_arg.h>
+#include <gnuradio/blocks/complex_to_mag_squared.h>
+
 #include "oscilloscope.hpp"
 
 #include "TimeDomainDisplayPlot.h"
 
 #include "networkanalyzerbufferviewer.h"
 #include "startstoprangewidget.h"
+#include "adc_sample_conv.hpp"
 
 extern "C" {
 	struct iio_buffer;
@@ -117,8 +126,6 @@ private:
 		double frequency;
 		size_t rate;
 		size_t bufferSize;
-		size_t adcRate;
-		size_t adcBuffer;
 	} networkIteration;
 
 	QVector<networkIteration> iterations;
@@ -129,6 +136,25 @@ private:
 
 	bool isIterationsThreadReady();
 	bool isIterationsThreadCanceled();
+
+	gr::fft::goertzel_fc::sptr goertzel1;
+	gr::fft::goertzel_fc::sptr goertzel2;
+	gr::blocks::copy::sptr copy1;
+	gr::blocks::copy::sptr copy2;
+	iio_manager::port_id id1;
+	iio_manager::port_id id2;
+	gr::blocks::head::sptr head1;
+	gr::blocks::head::sptr head2;
+	gr::blocks::vector_sink_f::sptr sink1;
+	gr::blocks::vector_sink_f::sptr sink2;
+	gr::blocks::complex_to_mag_squared::sptr c2m1;
+	gr::blocks::complex_to_mag_squared::sptr c2m2;
+	gr::blocks::multiply_conjugate_cc::sptr conj;
+	gr::blocks::complex_to_arg::sptr c2a;
+	boost::shared_ptr<signal_sample> signal;
+	boost::shared_ptr<adc_sample_conv> adc_conv;
+	float mag1, mag2, phase;
+	bool captureDone;
 
 	boost::mutex iterationsReadyMutex;
 	boost::condition_variable iterationsReadyCv;
@@ -168,6 +194,7 @@ private:
 	bool stop;
 
 	void run();
+	void goertzel();
 
 	struct iio_buffer *generateSinWave(
 		const struct iio_device *dev,
@@ -191,6 +218,13 @@ private:
 	void computeIterations();
 
 	double autoUpdateGainMode(double magnitude, double magnitudeGain);
+
+	void _configureDacFlowgraph();
+
+	void _configureAdcFlowgraph();
+	unsigned long _getBestSampleRate(double frequency, const iio_device *dev);
+	size_t _getSamplesCount(double frequency, unsigned long rate, bool perfect = false);
+	void computeFrequencyArray2();
 
 private Q_SLOTS:
 	void startStop(bool start);

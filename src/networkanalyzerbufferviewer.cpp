@@ -20,6 +20,8 @@
 #include "networkanalyzerbufferviewer.h"
 #include "ui_networkanalyzerbufferviewer.h"
 
+#include <qwt_plot_layout.h>
+
 using namespace adiscope;
 
 NetworkAnalyzerBufferViewer::NetworkAnalyzerBufferViewer(QWidget *parent) :
@@ -31,20 +33,7 @@ NetworkAnalyzerBufferViewer::NetworkAnalyzerBufferViewer(QWidget *parent) :
 {
 	d_ui->setupUi(this);
 
-	d_plot = new TimeDomainDisplayPlot(d_ui->mainWidget);
-	d_ui->mainLayout->addWidget(d_plot);
-
-	connect(d_ui->viewInOsc, &QPushButton::clicked,
-		this, &NetworkAnalyzerBufferViewer::sendBufferToOscilloscope);
-	connect(d_ui->previousBtn, &QPushButton::pressed,
-		this, &NetworkAnalyzerBufferViewer::btnPreviousClicked);
-	connect(d_ui->nextBtn, &QPushButton::pressed,
-		this, &NetworkAnalyzerBufferViewer::btnNextClicked);
-
-	d_plot->insertLegend(nullptr);
-
-	d_ui->nextBtn->setDisabled(true);
-	d_ui->previousBtn->setDisabled(true);
+	_setupPlot();
 }
 
 NetworkAnalyzerBufferViewer::~NetworkAnalyzerBufferViewer()
@@ -72,19 +61,13 @@ void NetworkAnalyzerBufferViewer::pushBuffers(QPair<Buffer, Buffer> buffers)
 	if (d_selectedBuffersIndex == -1) {
 		d_selectedBuffersIndex = 0;
 		selectBuffersAtIndex(d_selectedBuffersIndex);
-		d_ui->nextBtn->setEnabled(true);
-	}
-
-	if (d_selectedBuffersIndex < d_data.size() - 1) {
-		d_ui->nextBtn->setEnabled(true);
 	}
 }
 
-void NetworkAnalyzerBufferViewer::selectBuffersAtIndex(int index)
+void NetworkAnalyzerBufferViewer::selectBuffersAtIndex(int index, bool moveHandle)
 {
-
-	if (d_selectedBuffersIndex == index) {
-		return;
+	if (index != d_selectedBuffersIndex) {
+		Q_EMIT indexChanged(index);
 	}
 
 	d_selectedBuffersIndex = index;
@@ -124,18 +107,8 @@ void NetworkAnalyzerBufferViewer::selectBuffersAtIndex(int index)
 
 	// Move freq. handle on plot if prev/next button
 	// are used to navigate through the buffers
-	if (QObject::sender() == d_ui->previousBtn ||
-			QObject::sender() == d_ui->nextBtn) {
+	if (moveHandle) {
 		Q_EMIT moveHandleAt(d_data[index].first.frequency);
-	}
-
-	if (index == 0) {
-		d_ui->previousBtn->setDisabled(true);
-	} else if (index == d_data.size() - 1) {
-		d_ui->nextBtn->setDisabled(true);
-	} else {
-		d_ui->previousBtn->setEnabled(true);
-		d_ui->nextBtn->setEnabled(true);
 	}
 }
 
@@ -165,7 +138,7 @@ void NetworkAnalyzerBufferViewer::selectBuffers(double frequency)
 		return;
 	}
 
-	selectBuffersAtIndex(index);
+	selectBuffersAtIndex(index, false);
 }
 
 void NetworkAnalyzerBufferViewer::setVisible(bool visible)
@@ -175,7 +148,6 @@ void NetworkAnalyzerBufferViewer::setVisible(bool visible)
 	if (d_data.size()) {
 		d_selectedBuffersIndex = 0;
 		selectBuffersAtIndex(d_selectedBuffersIndex);
-		d_ui->nextBtn->setEnabled(true);
 	}
 }
 
@@ -188,8 +160,6 @@ void NetworkAnalyzerBufferViewer::clear()
 {
 	d_data.clear();
 	d_selectedBuffersIndex = -1;
-	d_ui->previousBtn->setDisabled(true);
-	d_ui->nextBtn->setDisabled(true);
 }
 
 void NetworkAnalyzerBufferViewer::sendBufferToOscilloscope()
@@ -220,12 +190,6 @@ void NetworkAnalyzerBufferViewer::btnPreviousClicked()
 	if (d_selectedBuffersIndex - 1 >= 0) {
 		selectBuffersAtIndex(d_selectedBuffersIndex - 1);
 	}
-
-	d_ui->nextBtn->setEnabled(true);
-
-	if (d_selectedBuffersIndex == 0) {
-		d_ui->previousBtn->setDisabled(true);
-	}
 }
 
 void NetworkAnalyzerBufferViewer::btnNextClicked()
@@ -233,10 +197,24 @@ void NetworkAnalyzerBufferViewer::btnNextClicked()
 	if (d_selectedBuffersIndex + 1 < d_data.size()) {
 		selectBuffersAtIndex(d_selectedBuffersIndex + 1);
 	}
-
-	d_ui->previousBtn->setEnabled(true);
-
-	if (d_selectedBuffersIndex == d_data.size() - 1) {
-		d_ui->nextBtn->setDisabled(true);
-	}
 }
+
+void NetworkAnalyzerBufferViewer::_setupPlot()
+{
+	d_plot = new TimeDomainDisplayPlot(d_ui->mainWidget);
+	d_ui->mainLayout->addWidget(d_plot);
+
+	d_plot->insertLegend(nullptr);
+	d_plot->setUsingLeftAxisScales(false);
+	int nrAxes = d_plot->axesCount(QwtPlot::yLeft);
+	for (int i = 0; i < nrAxes; ++i) {
+		d_plot->setAxisVisible(QwtAxisId(QwtPlot::yLeft, i),
+				false);
+	}
+	d_plot->setAxisVisible(QwtAxisId(QwtPlot::xBottom, 0),
+			false);
+
+	d_plot->plotLayout()->setAlignCanvasToScales(true);
+	d_ui->mainWidget->setMinimumHeight(150);
+}
+
